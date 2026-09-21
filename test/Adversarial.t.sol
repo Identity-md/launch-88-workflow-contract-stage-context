@@ -37,7 +37,7 @@ contract HostileToken {
                 abi.encodeCall(NameRegistry.transferName, ("alice", address(1))),
                 abi.encodeCall(NameRegistry.startRound, ()),
                 abi.encodeCall(NameRegistry.processSnapshot, (1)),
-                abi.encodeCall(NameRegistry.claim, ("alice"))
+                abi.encodeCall(NameRegistry.claim, ())
             ];
             for (uint256 i; i < calls.length; ++i) {
                 (bool ok, bytes memory data) = address(registry).call(calls[i]);
@@ -98,7 +98,6 @@ contract AdversarialTest is Test {
         registry.renew("alice");
         vm.warp(registry.nextRoundAt());
         registry.startRound();
-        registry.processSnapshot(1);
     }
 
     function testRejectedPayoutRetainsClaimAndFundsForRetry() public {
@@ -108,14 +107,14 @@ contract AdversarialTest is Test {
             token.configure(registry, mode);
             vm.prank(alice);
             vm.expectRevert();
-            registry.claim("alice");
+            registry.claim();
             assertEq(registry.claimedRound(alice), 0);
             assertEq(registry.poolBalance(), pool);
             assertEq(token.balanceOf(address(registry)), pool);
         }
         token.configure(registry, 0);
         vm.prank(alice);
-        registry.claim("alice");
+        registry.claim();
         assertEq(registry.poolBalance(), 0);
     }
 
@@ -124,13 +123,15 @@ contract AdversarialTest is Test {
         _ready();
         assertEq(token.blockedCallbacks(), 12);
         vm.prank(alice);
-        registry.claim("alice");
+        registry.claim();
         assertEq(token.blockedCallbacks(), 18);
         assertEq(registry.poolBalance(), 0);
         assertEq(registry.nameCount(), 1);
     }
 
-    function testExpiryDuringSnapshotUsesFrozenTimeButClaimNeedsLiveName() public {
+    /// @dev Eligibility is decided by the frozen snapshot timestamp alone. A lease that had already
+    /// lapsed at that instant earns nothing, and one that lapses afterwards still gets paid.
+    function testFrozenSnapshotTimeDecidesEligibilityNotLaterExpiry() public {
         vm.prank(alice);
         registry.register("alice");
         vm.warp(block.timestamp + 1);
@@ -139,18 +140,18 @@ contract AdversarialTest is Test {
         registry.register("bobby");
         vm.warp(registry.nextRoundAt());
         registry.startRound();
-        registry.processSnapshot(1);
-        vm.warp(block.timestamp + 1);
-        registry.processSnapshot(1);
+        assertFalse(registry.snapshotting());
         assertEq(registry.holderCount(), 1);
+        assertEq(registry.share(), 2 * registry.FEE());
+        vm.prank(alice);
+        vm.expectRevert(NameRegistry.NotEligible.selector);
+        registry.claim();
+        vm.warp(block.timestamp + 1);
+        (, uint256 expiry) = registry.names(keccak256("bobby"));
+        assertLe(expiry, block.timestamp);
         vm.prank(address(2));
-        vm.expectRevert(NameRegistry.NotHolder.selector);
-        registry.claim("bobby");
-        vm.prank(address(2));
-        registry.register("bobby");
-        vm.prank(address(2));
-        registry.claim("bobby");
-        assertEq(registry.poolBalance(), registry.FEE());
+        registry.claim();
+        assertEq(registry.poolBalance(), 0);
     }
 
     function testRuntimeOpcodeFloor() public {

@@ -8,7 +8,7 @@ interface IRegistryToken {
 }
 
 /// @notice Annual name leases and equal annual fee shares per snapshot holder address.
-/// @dev See README for snapshot liveness, current-holder proofs, and Sybil assumptions.
+/// @dev See README for snapshot liveness, entitlement timing, and Sybil assumptions.
 contract NameRegistry {
     uint256 public constant YEAR = 365 days;
     uint256 public constant FEE = 100 ether;
@@ -104,7 +104,11 @@ contract NameRegistry {
     }
 
     /// @notice Add one prepaid year to a live lease, paying the same fixed fee.
-    function renew(string calldata name_) external nonReentrant mutableNames {
+    /// @dev Deliberately not frozen during a snapshot: a renewable lease is live now and therefore
+    /// was already live at the earlier `snapshotAt`, and renewal changes neither the holder nor that
+    /// fact, so snapshot membership cannot depend on it. Freezing it would let anyone open a round
+    /// immediately before an expiry and block the holder from saving their own name.
+    function renew(string calldata name_) external nonReentrant {
         bytes32 id = nameId(name_);
         _requireHolder(id);
         names[id].expiresAt += YEAR;
@@ -116,12 +120,14 @@ contract NameRegistry {
     function transferName(string calldata name_, address to) external nonReentrant mutableNames {
         bytes32 id = nameId(name_);
         _requireHolder(id);
-        if (to == address(0) || to == msg.sender) revert InvalidRecipient();
+        if (to == address(0) || to == msg.sender || to == address(this)) revert InvalidRecipient();
         names[id].holder = to;
         emit NameTransferred(id, msg.sender, to);
     }
 
     /// @notice Permissionless annual snapshot. Prior unclaimed funds roll into this round.
+    /// @dev Processes the first batch inline, so a registry of at most MAX_BATCH names — and an
+    /// empty one — finishes its round in this call and is never left frozen awaiting a volunteer.
     function startRound() external nonReentrant mutableNames {
         if (block.timestamp < nextRoundAt) revert TooEarly();
         ++round;
@@ -133,12 +139,17 @@ contract NameRegistry {
         share = 0;
         snapshotting = true;
         emit RoundStarted(round, snapshotAt, snapshotPool);
+        _advanceSnapshot(MAX_BATCH);
     }
 
     /// @notice Anyone may advance the frozen snapshot; each call processes at most 200 names.
     function processSnapshot(uint256 count) external nonReentrant {
         if (!snapshotting) revert NoSnapshot();
         if (count == 0 || count > MAX_BATCH) revert InvalidBatch();
+        _advanceSnapshot(count);
+    }
+
+    function _advanceSnapshot(uint256 count) private {
         uint256 end = snapshotCursor + count;
         if (end > nameIds.length) end = nameIds.length;
         for (uint256 i = snapshotCursor; i < end; ++i) {
@@ -157,9 +168,10 @@ contract NameRegistry {
         }
     }
 
-    /// @notice Claim using any currently held live name as proof. Rights stay with snapshot addresses.
-    function claim(string calldata heldName) external nonReentrant mutableNames {
-        _requireHolder(nameId(heldName));
+    /// @notice Claim this round's share. Entitlement belongs to the address that held a live name at
+    /// `snapshotAt`, and nothing it does afterwards — transferring, letting a lease lapse — can strand
+    /// the share, because no second proof of current holding is required.
+    function claim() external nonReentrant mutableNames {
         if (round == 0 || eligibleRound[msg.sender] != round || share == 0) revert NotEligible();
         if (claimedRound[msg.sender] == round) revert AlreadyClaimed();
         claimedRound[msg.sender] = round;

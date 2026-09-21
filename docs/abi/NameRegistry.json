@@ -52,13 +52,7 @@
   {
     "type": "function",
     "name": "claim",
-    "inputs": [
-      {
-        "name": "heldName",
-        "type": "string",
-        "internalType": "string"
-      }
-    ],
+    "inputs": [],
     "outputs": [],
     "stateMutability": "nonpayable"
   },

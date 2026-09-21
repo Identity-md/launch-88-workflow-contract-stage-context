@@ -40,7 +40,9 @@ contract NameRegistryTest is Test {
     function _round() internal {
         vm.warp(registry.nextRoundAt());
         registry.startRound();
-        registry.processSnapshot(200);
+        while (registry.snapshotting()) {
+            registry.processSnapshot(200);
+        }
     }
 
     function _liveHolders() internal {
@@ -48,6 +50,44 @@ contract NameRegistryTest is Test {
         _renew(alice, "alice");
         _register(bob, "bobby");
         _renew(bob, "bobby");
+    }
+
+    /// @dev The frontend rebuilds "my names" from these logs, so topics and payloads are asserted
+    /// exactly: a swapped from/to or a wrong expiry is a wrong website, not just a cosmetic defect.
+    function testLeaseEventsCarryExactTopicsAndPayloads() public {
+        uint256 start = block.timestamp;
+        bytes32 id = registry.nameId("alice");
+        vm.expectEmit(true, true, false, true, address(registry));
+        emit NameRegistry.Registered(id, "alice", alice, start + YEAR);
+        _register(alice, "alice");
+        vm.expectEmit(true, false, false, true, address(registry));
+        emit NameRegistry.Renewed(id, start + 2 * YEAR);
+        _renew(alice, "alice");
+        vm.expectEmit(true, true, true, true, address(registry));
+        emit NameRegistry.NameTransferred(id, alice, bob);
+        vm.prank(alice);
+        registry.transferName("alice", bob);
+        vm.warp(start + 2 * YEAR);
+        vm.expectEmit(true, true, false, true, address(registry));
+        emit NameRegistry.Registered(id, "alice", carol, start + 3 * YEAR);
+        _register(carol, "alice");
+    }
+
+    function testDistributionEventsCarryExactTopicsAndPayloads() public {
+        _liveHolders();
+        uint256 at = registry.nextRoundAt();
+        vm.warp(at);
+        vm.expectEmit(true, false, false, true, address(registry));
+        emit NameRegistry.RoundStarted(1, at, 4 * FEE);
+        vm.expectEmit(true, false, false, true, address(registry));
+        emit NameRegistry.SnapshotProgress(1, 2, 2);
+        vm.expectEmit(true, false, false, true, address(registry));
+        emit NameRegistry.RoundReady(1, 2, 2 * FEE);
+        registry.startRound();
+        vm.expectEmit(true, true, false, true, address(registry));
+        emit NameRegistry.Claimed(1, alice, 2 * FEE);
+        vm.prank(alice);
+        registry.claim();
     }
 
     function testConstructorAndNoETH() public {
@@ -92,6 +132,9 @@ contract NameRegistryTest is Test {
         vm.prank(alice);
         vm.expectRevert(NameRegistry.InvalidRecipient.selector);
         registry.transferName("alice", alice);
+        vm.prank(alice);
+        vm.expectRevert(NameRegistry.InvalidRecipient.selector);
+        registry.transferName("alice", address(registry));
         vm.warp(start + YEAR - 1);
         _renew(alice, "alice");
         vm.prank(alice);
@@ -129,7 +172,7 @@ contract NameRegistryTest is Test {
         assertEq(token.allowance(alice, address(registry)), 1);
     }
 
-    function testSnapshotTimingAndFreeze() public {
+    function testSnapshotTimingAndSmallRegistrySettlesInOneCall() public {
         _liveHolders();
         vm.expectRevert(NameRegistry.TooEarly.selector);
         registry.startRound();
@@ -137,26 +180,26 @@ contract NameRegistryTest is Test {
         registry.processSnapshot(1);
         vm.warp(registry.nextRoundAt());
         registry.startRound();
-        vm.expectRevert(NameRegistry.InvalidBatch.selector);
-        registry.processSnapshot(0);
-        vm.expectRevert(NameRegistry.InvalidBatch.selector);
-        registry.processSnapshot(201);
-        vm.expectRevert(NameRegistry.SnapshotInProgress.selector);
-        registry.register("carol");
-        vm.expectRevert(NameRegistry.SnapshotInProgress.selector);
-        registry.renew("alice");
-        vm.expectRevert(NameRegistry.SnapshotInProgress.selector);
-        registry.transferName("alice", bob);
-        vm.expectRevert(NameRegistry.SnapshotInProgress.selector);
-        registry.claim("alice");
-        vm.expectRevert(NameRegistry.SnapshotInProgress.selector);
-        registry.startRound();
-        registry.processSnapshot(1);
-        assertTrue(registry.snapshotting());
-        vm.prank(carol);
-        registry.processSnapshot(1);
         assertFalse(registry.snapshotting());
         assertEq(registry.holderCount(), 2);
+        assertEq(registry.share(), 2 * FEE);
+        vm.expectRevert(NameRegistry.NoSnapshot.selector);
+        registry.processSnapshot(1);
+        vm.expectRevert(NameRegistry.TooEarly.selector);
+        registry.startRound();
+        _register(carol, "carol");
+    }
+
+    /// @dev A registry with no names must not be left frozen waiting for an unpaid volunteer.
+    function testEmptyRegistryRoundNeedsNoSecondTransaction() public {
+        vm.warp(registry.nextRoundAt());
+        vm.prank(carol);
+        registry.startRound();
+        assertFalse(registry.snapshotting());
+        assertEq(registry.round(), 1);
+        assertEq(registry.holderCount(), 0);
+        assertEq(registry.share(), 0);
+        _register(alice, "alice");
     }
 
     function testEqualSharesUniqueHoldersAndConservation() public {
@@ -169,78 +212,82 @@ contract NameRegistryTest is Test {
         uint256 a = token.balanceOf(alice);
         uint256 b = token.balanceOf(bob);
         vm.prank(bob);
-        registry.claim("bobby");
+        registry.claim();
         vm.prank(alice);
-        registry.claim("alice");
+        registry.claim();
         assertEq(token.balanceOf(alice) - a, token.balanceOf(bob) - b);
         assertEq(registry.poolBalance(), 0);
         assertEq(token.balanceOf(address(registry)), 0);
         vm.prank(alice);
         vm.expectRevert(NameRegistry.AlreadyClaimed.selector);
-        registry.claim("other");
+        registry.claim();
     }
 
-    function testLateEntryTransferAndCurrentHolderProof() public {
+    /// @dev Entitlement belongs to the snapshot address: giving a name away neither moves the share
+    /// nor strands it, and a late entrant waits for the next snapshot rather than sharing this one.
+    function testLateEntryAndTransferLeaveNoShareStranded() public {
         _liveHolders();
         _round();
+        assertEq(registry.share(), 2 * FEE);
         _register(carol, "carol");
         vm.prank(carol);
         vm.expectRevert(NameRegistry.NotEligible.selector);
-        registry.claim("carol");
+        registry.claim();
         vm.prank(alice);
         registry.transferName("alice", carol);
         vm.prank(alice);
-        vm.expectRevert(NameRegistry.NotHolder.selector);
-        registry.claim("alice");
+        registry.claim();
         vm.prank(carol);
         vm.expectRevert(NameRegistry.NotEligible.selector);
-        registry.claim("alice");
-        vm.prank(carol);
-        registry.transferName("alice", alice);
-        vm.prank(alice);
-        registry.claim("alice");
-        vm.prank(alice);
-        registry.transferName("alice", bob);
+        registry.claim();
         vm.prank(bob);
-        registry.claim("alice");
+        registry.claim();
         vm.prank(bob);
         vm.expectRevert(NameRegistry.AlreadyClaimed.selector);
-        registry.claim("bobby");
+        registry.claim();
         assertEq(registry.poolBalance(), FEE);
+        assertEq(token.balanceOf(address(registry)), FEE);
+        _renew(carol, "carol");
+        _renew(bob, "bobby");
+        _round();
+        assertEq(registry.round(), 2);
+        assertEq(registry.holderCount(), 2);
+        assertEq(registry.share(), 3 * FEE / 2);
+        vm.prank(carol);
+        registry.claim();
+        vm.prank(alice);
+        vm.expectRevert(NameRegistry.NotEligible.selector);
+        registry.claim();
     }
 
-    function testExpiredSnapshotAndEmptyRound() public {
+    function testExpiredAtSnapshotEarnsNothing() public {
         _register(alice, "alice");
         _round();
         assertEq(registry.holderCount(), 0);
         assertEq(registry.share(), 0);
         vm.prank(alice);
-        vm.expectRevert(NameRegistry.NotHolder.selector);
-        registry.claim("alice");
+        vm.expectRevert(NameRegistry.NotEligible.selector);
+        registry.claim();
         _register(alice, "alice");
         vm.prank(alice);
         vm.expectRevert(NameRegistry.NotEligible.selector);
-        registry.claim("alice");
-        NameRegistry empty = new NameRegistry(address(token));
-        vm.warp(empty.nextRoundAt());
-        empty.startRound();
-        empty.processSnapshot(1);
-        assertFalse(empty.snapshotting());
+        registry.claim();
+        assertEq(registry.poolBalance(), 2 * FEE);
     }
 
     function testUnclaimedAndRoundingRollOverAndClaimAgain() public {
         _liveHolders();
         _round();
         vm.prank(alice);
-        registry.claim("alice");
+        registry.claim();
         _renew(alice, "alice");
         _renew(bob, "bobby");
         _round();
         assertEq(registry.share(), 2 * FEE);
         vm.prank(alice);
-        registry.claim("alice");
+        registry.claim();
         vm.prank(bob);
-        registry.claim("bobby");
+        registry.claim();
         assertEq(registry.poolBalance(), 0);
     }
 
@@ -254,11 +301,11 @@ contract NameRegistryTest is Test {
         uint256 expected = 7 * FEE / 3;
         assertEq(registry.share(), expected);
         vm.prank(alice);
-        registry.claim("alice");
+        registry.claim();
         vm.prank(bob);
-        registry.claim("bobby");
+        registry.claim();
         vm.prank(carol);
-        registry.claim("carol");
+        registry.claim();
         assertEq(registry.poolBalance(), 7 * FEE % 3);
         assertEq(token.balanceOf(address(registry)), registry.poolBalance() + 17);
     }
@@ -272,14 +319,16 @@ contract NameRegistryTest is Test {
         _round();
         uint256 share = registry.share();
         vm.prank(reverse ? bob : alice);
-        registry.claim(reverse ? "bobby" : "alice");
+        registry.claim();
         vm.prank(reverse ? alice : bob);
-        registry.claim(reverse ? "alice" : "bobby");
+        registry.claim();
         assertEq(registry.poolBalance() + 2 * share, (4 + uint256(renewals)) * FEE);
         assertEq(token.balanceOf(address(registry)), registry.poolBalance());
     }
 
-    function testLargeSnapshotRequiresMultipleBoundedCalls() public {
+    /// @dev Beyond one batch the snapshot spans transactions, which is the only state in which name
+    /// operations are frozen. Renewal stays open there on purpose; see testRenewalSurvivesAnAttacker.
+    function testLargeSnapshotFreezesEverythingExceptRenewal() public {
         for (uint256 i; i < 201; ++i) {
             string memory name =
                 string(abi.encodePacked(bytes1(0x61), bytes1(uint8(0x61 + i / 26)), bytes1(uint8(0x61 + i % 26))));
@@ -289,15 +338,66 @@ contract NameRegistryTest is Test {
         }
         vm.warp(registry.nextRoundAt());
         registry.startRound();
-        registry.processSnapshot(200);
         assertTrue(registry.snapshotting());
         assertEq(registry.snapshotCursor(), 200);
+        vm.expectRevert(NameRegistry.InvalidBatch.selector);
+        registry.processSnapshot(0);
+        vm.expectRevert(NameRegistry.InvalidBatch.selector);
+        registry.processSnapshot(201);
+        vm.prank(bob);
+        vm.expectRevert(NameRegistry.SnapshotInProgress.selector);
+        registry.register("bobby");
+        vm.prank(alice);
+        vm.expectRevert(NameRegistry.SnapshotInProgress.selector);
+        registry.transferName("aaa", bob);
+        vm.prank(alice);
+        vm.expectRevert(NameRegistry.SnapshotInProgress.selector);
+        registry.claim();
+        vm.expectRevert(NameRegistry.SnapshotInProgress.selector);
+        registry.startRound();
+        token.transfer(alice, FEE);
+        _renew(alice, "aaa");
+        vm.prank(carol);
         registry.processSnapshot(200);
         assertFalse(registry.snapshotting());
         assertEq(registry.holderCount(), 1);
         assertEq(registry.share(), 402 * FEE);
         vm.prank(alice);
-        registry.claim("aaa");
-        assertEq(registry.poolBalance(), 0);
+        registry.claim();
+        assertEq(registry.poolBalance(), FEE);
+    }
+
+    /// @dev Regression: a permissionless startRound() must not be usable to hold renew() shut across
+    /// a lease's expiry and take the name. The freeze is timed by the attacker, so renewal cannot be
+    /// part of it. Renewing mid-snapshot cannot change membership either: the lease is live now, so
+    /// it was already live at the earlier snapshotAt, and the holder does not change.
+    function testRenewalSurvivesAnAttackerTimedRoundStart() public {
+        uint256 start = block.timestamp;
+        _register(alice, "alice");
+        _renew(alice, "alice");
+        for (uint256 i; i < 200; ++i) {
+            string memory name =
+                string(abi.encodePacked(bytes1(0x7a), bytes1(uint8(0x61 + i / 26)), bytes1(uint8(0x61 + i % 26))));
+            token.transfer(bob, FEE);
+            _register(bob, name);
+        }
+        vm.warp(start + 2 * YEAR - 12);
+        vm.prank(carol);
+        registry.startRound();
+        assertTrue(registry.snapshotting());
+        _renew(alice, "alice");
+        (, uint256 expiry) = registry.names(registry.nameId("alice"));
+        assertEq(expiry, start + 3 * YEAR);
+        vm.warp(start + 2 * YEAR);
+        registry.processSnapshot(200);
+        assertFalse(registry.snapshotting());
+        (address holder,) = registry.names(registry.nameId("alice"));
+        assertEq(holder, alice);
+        vm.prank(carol);
+        vm.expectRevert(NameRegistry.Unavailable.selector);
+        registry.register("alice");
+        assertEq(registry.eligibleRound(alice), registry.round());
+        vm.prank(alice);
+        registry.claim();
     }
 }

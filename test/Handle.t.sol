@@ -20,6 +20,21 @@ contract HandleTest is Test {
         assertEq(token.balanceOf(address(this)), 1e27);
     }
 
+    function testTransferAndApprovalEventsCarryExactPayloads() public {
+        vm.expectEmit(true, true, false, true, address(token));
+        emit Handle.Transfer(address(this), alice, 5);
+        token.transfer(alice, 5);
+        vm.expectEmit(true, true, false, true, address(token));
+        emit Handle.Approval(address(this), alice, 7);
+        token.approve(alice, 7);
+        vm.expectEmit(true, true, false, true, address(token));
+        emit Handle.Approval(address(this), alice, 4);
+        vm.expectEmit(true, true, false, true, address(token));
+        emit Handle.Transfer(address(this), bob, 3);
+        vm.prank(alice);
+        token.transferFrom(address(this), bob, 3);
+    }
+
     function testFuzzTransferConservation(uint256 amount) public {
         amount = bound(amount, 0, token.totalSupply());
         token.transfer(alice, amount);
