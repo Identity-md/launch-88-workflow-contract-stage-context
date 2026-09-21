@@ -1,0 +1,22 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "Handle",
+    "name": "Handle",
+    "symbol": "HNDL",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "NameRegistry",
+      "constructorArgs": ["$token"]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Deploy Handle with no constructor arguments, then NameRegistry with the deployed Handle address. Neither contract has an owner or administrator; no initialization calls are required. NameRegistry charges its immutable 100 HNDL fee for registration or renewal of 365-day leases. Annual fee shares use permissionless batched snapshots of distinct holder addresses; claims require a currently held live name. Snapshot completion requires callers and temporarily freezes name operations. The pool pairs with native ETH, has no hook, and uses decimal sqrtPriceX96; its initial price is not a promised market valuation. Policy, signed artifact linkage, independent review, admission and deployment are handled by the corresponding services."
+}
